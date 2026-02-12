@@ -17,7 +17,7 @@ from aiogram.types import (
 from aiogram.filters import Command
 
 
-TOKEN = "8296403634:AAGCb1PeGx7yQMdimzft6SS2p2xAxeOf7r0"
+TOKEN = "8430903715:AAEEH7iBocErg43XDGLhM0BdbpG163h9NXQ"
 DOMAIN = "http://short.tumblersapp.ru/"
 
 bot = Bot(token=TOKEN)
