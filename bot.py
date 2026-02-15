@@ -2,6 +2,7 @@ import sqlite3
 import string
 import random
 import asyncio
+import re
 from datetime import datetime
 from io import BytesIO
 import qrcode
@@ -24,22 +25,24 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
-# ---------- DATABASE ----------
+# ================= DATABASE =================
+
+def get_connection():
+    return sqlite3.connect("database.db")
+
+
 def init_db():
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS links (
-        code TEXT PRIMARY KEY,
-        url TEXT,
-        created_at TEXT,
-        clicks INTEGER DEFAULT 0
-    )
-    """)
-
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS links (
+            code TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            created_at TEXT,
+            clicks INTEGER DEFAULT 0
+        )
+        """)
+        conn.commit()
 
 
 def generate_code(length=6):
@@ -47,46 +50,53 @@ def generate_code(length=6):
 
 
 def save_link(code, url):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO links VALUES (?, ?, ?, 0)",
-        (code, url, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO links (code, url, created_at, clicks) VALUES (?, ?, ?, 0)",
+            (code, url, datetime.utcnow().isoformat())
+        )
+        conn.commit()
 
 
 def get_clicks(code):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT clicks FROM links WHERE code=?", (code,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else 0
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT clicks FROM links WHERE code=?", (code,))
+        row = cursor.fetchone()
+        return row[0] if row else 0
 
 
-# ---------- START ----------
-@dp.message(Command("start"))
-async def start(message: Message):
-    await message.answer("Отправь ссылку — я сокращу её 🚀")
+# ================= HELPERS =================
+
+def normalize_url(url: str) -> str:
+    url = url.strip()
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    return url
 
 
-# ---------- SHORTEN ----------
-@dp.message(F.text)
-async def shorten(message: Message):
-    url = message.text.strip()
+def is_valid_url(url: str) -> bool:
+    pattern = re.compile(
+        r'^(https?:\/\/)'
+        r'([\da-z\.-]+)\.'
+        r'([a-z\.]{2,6})'
+        r'([\/\w\.-]*)*\/?$'
+    )
+    return bool(pattern.match(url))
 
-    if not url.startswith("http"):
-        await message.answer("Пришли корректную ссылку.")
-        return
 
-    code = generate_code()
-    save_link(code, url)
+def generate_qr(url: str) -> BufferedInputFile:
+    qr_img = qrcode.make(url)
+    buffer = BytesIO()
+    qr_img.save(buffer, format="PNG")
+    return BufferedInputFile(buffer.getvalue(), filename="qr.png")
 
-    short_url = DOMAIN + code
 
-    keyboard = InlineKeyboardMarkup(
+def build_keyboard(short_url: str, code: str):
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Открыть", url=short_url)],
             [InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats:{code}")],
@@ -94,24 +104,42 @@ async def shorten(message: Message):
         ]
     )
 
-    # --- QR ---
-    qr_img = qrcode.make(short_url)
-    buffer = BytesIO()
-    qr_img.save(buffer, format="PNG")
 
-    photo = BufferedInputFile(
-        buffer.getvalue(),
-        filename="qr.png"
-    )
+# ================= HANDLERS =================
+
+@dp.message(Command("start"))
+async def start(message: Message):
+    await message.answer("Отправь ссылку — я сокращу её 🚀")
+
+
+@dp.message(F.text)
+async def shorten(message: Message):
+    raw_url = message.text.strip()
+    url = normalize_url(raw_url)
+
+    if not is_valid_url(url):
+        await message.answer("❌ Пришли корректную ссылку.")
+        return
+
+    code = generate_code()
+    short_url = DOMAIN + code
+
+    try:
+        save_link(code, url)
+    except sqlite3.IntegrityError:
+        await message.answer("Ошибка при сохранении ссылки.")
+        return
+
+    keyboard = build_keyboard(short_url, code)
+    qr_photo = generate_qr(short_url)
 
     await message.answer_photo(
-        photo=photo,
+        photo=qr_photo,
         caption=f"🔗 Ваша ссылка:\n{short_url}",
         reply_markup=keyboard
     )
 
 
-# ---------- CALLBACKS ----------
 @dp.callback_query(F.data.startswith("stats:"))
 async def stats_callback(callback: CallbackQuery):
     code = callback.data.split(":")[1]
@@ -127,7 +155,8 @@ async def new_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- MAIN ----------
+# ================= MAIN =================
+
 async def main():
     init_db()
     await dp.start_polling(bot)
